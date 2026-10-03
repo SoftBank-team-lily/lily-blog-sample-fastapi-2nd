@@ -29,6 +29,26 @@
   .post p { margin: 0; white-space: pre-wrap; }
   .post time, .empty, .error { color: var(--muted); font-size: 13px; }
   .error { min-height: 1em; }
+  .load { border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 40px; }
+  .load h2 { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+  .load .hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  .load .controls { display: grid; grid-template-columns: repeat(3, 1fr) auto; gap: 8px; align-items: end; }
+  .load label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+  .load input { padding: 8px 10px; }
+  .load button { padding: 9px 16px; }
+  .load .status { color: var(--muted); font-size: 13px; margin: 12px 0 10px; min-height: 1.6em; }
+  .share { display: flex; height: 6px; border-radius: 999px; overflow: hidden; background: var(--line); margin-bottom: 14px; }
+  .share span { transition: width .3s ease; }
+  .lane { display: grid; grid-template-columns: 72px 1fr 44px; gap: 10px; align-items: center; margin-top: 8px; font-size: 13px; }
+  .lane b { font-weight: 500; }
+  .lane .count { text-align: right; font-variant-numeric: tabular-nums; }
+  .dots { display: flex; flex-wrap: wrap; gap: 3px; min-height: 8px; }
+  .dots i { width: 8px; height: 8px; border-radius: 2px; background: currentColor; animation: pop .3s ease; }
+  .local { color: var(--lily); } .cloud { color: #6ea8ff; } .fail { color: #e5736b; }
+  .share .local, .share .cloud, .share .fail { background: currentColor; }
+  @keyframes pop { from { transform: scale(0); opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .dots i { animation: none; } }
+  @media (max-width: 480px) { .load .controls { grid-template-columns: repeat(3, 1fr); } .load button { grid-column: 1 / -1; } }
 </style>
 </head>
 <body>
@@ -60,6 +80,22 @@
       </form>
     </div>
   </div>
+
+  <section class="load" aria-labelledby="load-title">
+    <h2 id="load-title">부하 시험</h2>
+    <p class="hint">느린 요청을 한꺼번에 보내 내 PC 처리 한도를 넘기면, 넘친 요청이 클라우드에서 처리됩니다.</p>
+    <div class="controls">
+      <label>동시 요청<input id="lc" type="number" min="1" max="30" value="20"></label>
+      <label>시간(초)<input id="ld" type="number" min="1" max="30" value="10"></label>
+      <label>지연(ms)<input id="lm" type="number" min="0" max="3000" step="100" value="500"></label>
+      <button id="lrun" type="button">부하 주기</button>
+    </div>
+    <div class="status" id="lstatus" aria-live="polite"></div>
+    <div class="share"><span class="local" id="slocal"></span><span class="cloud" id="scloud"></span><span class="fail" id="sfail"></span></div>
+    <div class="lane local"><b>내 PC</b><div class="dots" id="dlocal"></div><span class="count" id="clocal">0</span></div>
+    <div class="lane cloud"><b>클라우드</b><div class="dots" id="dcloud"></div><span class="count" id="ccloud">0</span></div>
+    <div class="lane fail"><b>실패</b><div class="dots" id="dfail"></div><span class="count" id="cfail">0</span></div>
+  </section>
 
   <section id="posts"></section>
 </main>
@@ -124,6 +160,74 @@
   });
 
   load();
+
+  // 부하 시험: 동시 요청 수만큼 루프를 돌려 /api/slow 를 계속 부르고, 응답의 place 로 처리 거점을 나눈다
+  const DOTS = 120;
+  let running = null;
+
+  function clamp(id, min, max) {
+    const n = Math.round(Number($(id).value) || min);
+    $(id).value = Math.max(min, Math.min(n, max));
+    return Number($(id).value);
+  }
+
+  function addDot(kind) {
+    const lane = $("d" + kind);
+    lane.append(document.createElement("i"));
+    if (lane.children.length > DOTS) lane.firstElementChild.remove();
+  }
+
+  function render(stats, active, startedAt) {
+    const total = stats.local + stats.cloud + stats.fail;
+    for (const kind of ["local", "cloud", "fail"]) {
+      $("c" + kind).textContent = stats[kind];
+      $("s" + kind).style.width = total ? (stats[kind] / total) * 100 + "%" : "0";
+    }
+    const sec = ((Date.now() - startedAt) / 1000).toFixed(1);
+    const share = total ? Math.round((stats.cloud / total) * 100) : 0;
+    $("lstatus").textContent = active
+      ? `진행 중 · 동시 ${active}개 · ${sec}초 · 클라우드 ${share}%`
+      : `끝 · 총 ${total}건 · 클라우드 ${share}%`;
+  }
+
+  async function runLoad() {
+    const concurrency = clamp("lc", 1, 30);
+    const until = Date.now() + clamp("ld", 1, 30) * 1000;
+    const ms = clamp("lm", 0, 3000);
+    const stats = { local: 0, cloud: 0, fail: 0 };
+    const startedAt = Date.now();
+    let active = 0;
+    running = { stop: false };
+    const run = running;
+    for (const kind of ["local", "cloud", "fail"]) $("d" + kind).replaceChildren();
+    $("lrun").textContent = "멈추기";
+
+    async function worker() {
+      active++;
+      while (!run.stop && Date.now() < until) {
+        let kind = "fail";
+        try {
+          const res = await fetch(`/api/slow?ms=${ms}`, { cache: "no-store" });
+          if (res.ok) kind = (await res.json()).place === "cloud" ? "cloud" : "local";
+        } catch {}
+        stats[kind]++;
+        addDot(kind);
+        render(stats, active, startedAt);
+        if (kind === "fail") await new Promise((r) => setTimeout(r, 300));
+      }
+      active--;
+    }
+
+    await Promise.all(Array.from({ length: concurrency }, worker));
+    render(stats, 0, startedAt);
+    running = null;
+    $("lrun").textContent = "부하 주기";
+  }
+
+  $("lrun").addEventListener("click", () => {
+    if (running) running.stop = true;
+    else runLoad();
+  });
 </script>
 </body>
 </html>

@@ -1,4 +1,6 @@
+import asyncio
 import os
+import socket
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,6 +13,9 @@ from pydantic import BaseModel, Field
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 USE_POSTGRES = DATABASE_URL.startswith("postgres")
 INDEX = Path(__file__).parent / "static" / "index.html"
+# 클라우드 Pod 에는 쿠버네티스가 KUBERNETES_SERVICE_HOST 를 넣는다. 없으면 내 PC(온프레미스)에서 도는 것
+PLACE = "cloud" if os.getenv("KUBERNETES_SERVICE_HOST") else "local"
+HOSTNAME = socket.gethostname()
 
 if USE_POSTGRES:
     import psycopg
@@ -88,3 +93,11 @@ def create_post(post: PostIn):
         (post.title.strip(), post.body.strip()),
     )
     return to_post(rows[0])
+
+
+@app.get("/api/slow")
+async def slow(ms: int = 500):
+    # 부하 시험용. 일부러 ms 만큼 붙잡아 동시 처리 수가 쌓이게 한다. 처리한 거점을 돌려준다
+    ms = max(0, min(ms, 3000))
+    await asyncio.sleep(ms / 1000)
+    return {"place": PLACE, "host": HOSTNAME, "ms": ms}
